@@ -78,7 +78,7 @@ Save the file.
 
 You can now build the `CaeUnsMyOpenFOAM` plugin on your platform. If all 
 builds correctly, you now have a CaeUnsMyOpenFOAM plugin that is functionally 
-equvalent to the OpenFOAM plugin distributed with Pointwise. You are now ready 
+equivalent to the OpenFOAM plugin distributed with Pointwise. You are now ready 
 to make your changes to the CaeUnsMyOpenFOAM plugin.
 
 ### Closing Thoughts
@@ -86,10 +86,10 @@ to make your changes to the CaeUnsMyOpenFOAM plugin.
 See the [Building a CAE Plugin][SDKbuild] for information on configuring your 
 SDK build environment.
 
-If you plan on publicly releasing binary builds of your version of the OpenFOAM 
-plugin, you need to be careful about your choice of site id, site group name, 
-plugin id, and plugin name. See documentation for [site.h][SDKsite.H] for 
-details. Your plugin may not load correctly into Pointwise if the values you 
+If you plan on publicly releasing source or binary builds of your version of 
+the OpenFOAM plugin, you need to be careful about your choice of site id, site 
+group name, plugin id, and plugin name. See documentation for [site.h][SDKsite.H] 
+for details. Your plugin may not load correctly into Pointwise if the values you 
 choose conflict with other CAE plugins.
 
 Being open source, we would like to see any enhancements or bug fixes you make 
