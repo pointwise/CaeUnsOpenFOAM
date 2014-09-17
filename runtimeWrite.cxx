@@ -1607,7 +1607,7 @@ runtimeCreate(CAEP_RTITEM * /* pRti */)
 
 
 /***************************************************************************
- * runtimeCreate is the plugin API entry point for plugin destruction, called
+ * runtimeDestroy is the plugin API entry point for plugin destruction, called
  * when the plugin is unloaded
  ***************************************************************************/
 PWP_VOID
