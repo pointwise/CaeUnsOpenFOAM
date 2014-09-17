@@ -8,9 +8,9 @@ compatible with the version of Pointwise you are targeting.
 
 To integrate the OpenFOAM source code, you must first create a plugin project 
 in your SDK using the steps shown below. You may replace `MyOpenFOAM` with any 
-unique name you choose. The OpenFOAM plugin was written using the C language 
-before C++ support was added to the Pointwise Plugin SDK. As a result, you 
-*must* use the `-c` option with `mkplugin` below.
+unique name you choose. Even though the SDK builds with C++ compilers, the 
+OpenFOAM plugin uses the C-style entry points. Consequently, you *must* use the 
+`-c` option with `mkplugin` below.
 
 If you plan on building the plugin for multiple platforms, I suggest that you 
 place the SDK on a network drive. That way you can build the OpenFOAM plugin 
