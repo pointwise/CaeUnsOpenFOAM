@@ -759,8 +759,9 @@ public:
             fprintf(*this, "    %s\n", it->name_.c_str());
             fprintf(*this, "    {\n");
             fprintf(*this, "        type %s;\n", it->type_.c_str());
-            fprintf(*this, "        nFaces %d;\n", (int)it->nFaces_);
-            fprintf(*this, "        startFace %d;\n", (int)it->startFace_);
+            fprintf(*this, "        nFaces %lu;\n", (unsigned long)it->nFaces_);
+            fprintf(*this, "        startFace %lu;\n",
+                (unsigned long)it->startFace_);
             fprintf(*this, "    }\n");
             incrNumItems();
         }
