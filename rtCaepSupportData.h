@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright 2014 (c) Pointwise, Inc.
+ * Copyright (c) 2012-2016 Pointwise, Inc.
  * All rights reserved.
  *
  * This sample Pointwise plugin is not supported by Pointwise, Inc.
@@ -30,6 +30,7 @@ CAEP_BCINFO ofoamBCInfo[] = {
     { "empty",          103 },
     { "wedge",          104 },
     { "cyclic",         105 },
+    { "faceSet",        106 },
 };
 
 /*------------------------------------*/

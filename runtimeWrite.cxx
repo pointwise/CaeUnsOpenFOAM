@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright 2014 (c) Pointwise, Inc.
+ * Copyright (c) 2012-2016 Pointwise, Inc.
  * All rights reserved.
  *
  * This sample Pointwise plugin is not supported by Pointwise, Inc.
@@ -23,13 +23,16 @@
 #include "pwpPlatform.h"
 #include "vctypes.h"
 
+#include <algorithm> // don't need this for C++11
+#include <cmath>
 #include <cstring>
 #include <errno.h>
-#include <set>
-#include <string>
 #include <map>
+#include <set>
+#include <sstream>
+#include <string>
 #include <vector>
-
+//#include <utility> // std::swap<T>() moved here in C++11
 
 #if defined(WINDOWS)
 #   include <direct.h>
@@ -41,6 +44,8 @@
 #   include <sys/types.h>
 #endif /* WINDOWS */
 
+#include <math.h>
+
 // Disable warnings caused by the current usage of fgets, fscanf, etc.
 #if defined(linux)
 #pragma GCC diagnostic ignored "-Wunused-result"
@@ -51,6 +56,38 @@ typedef std::set<std::string>               StringSet;
 typedef std::vector<std::string>            StringVec;
 typedef std::map<PWP_UINT32, PWP_UINT32>    UInt32UInt32Map;
 typedef std::map<const char*, PWP_UINT32>   CharPtrUInt32Map;
+
+enum Orientation {
+    NegativeZ = -1,
+    UnknownZ = 0,
+    PositiveZ = 1
+};
+
+
+static const char *Unspecified = "Unspecified";
+static const PWGM_CONDDATA UnspecifiedCond = {
+    Unspecified,
+    PWGM_UNSPECIFIED_COND_ID,
+    Unspecified,
+    PWGM_UNSPECIFIED_TYPE_ID
+};
+
+static const char *FaceExport       = "FaceExport";
+static const char *CellExport       = "CellExport";
+static const char *PointPrecision   = "PointPrecision";
+static const char *Thickness        = "Thickness";
+static const char *SideBCExport     = "SideBCExport";
+enum SideBcMode {
+    BcModeUnspecified,
+    BcModeSingle,
+    BcModeBaseTop,
+    BcModeMultiple
+};
+
+static const PWP_REAL   ThicknessDef            = 0.0;
+static const char *     ThicknessDefStr         = "0.0";
+static const PWP_UINT   PointPrecisionDef       = 16;
+static const char *     PointPrecisionDefStr    = "16";
 
 
 /***************************************************************************
@@ -75,6 +112,73 @@ static int
 pwpDeleteDir(const char *dir)
 {
     return rmdir(dir);
+}
+
+
+// return a sanitized file name
+static const char *
+safeFileName(const char *unsafeName, const char *suffix = "")
+{
+    const std::string safeChars("-_.");
+    static std::string safeName;
+    safeName = unsafeName;
+    std::string::iterator it = safeName.begin();
+    for (; it != safeName.end(); ++it) {
+        // replace invalid characters in the file name with underscore
+        if (!isalnum(*it) && (std::string::npos == safeChars.find(*it))) {
+            *it = '_';
+        }
+    }
+    safeName += suffix;
+    return safeName.c_str();
+}
+
+// return a unique sanitized file name
+static const char *
+uniqueSafeFileName(const char *unsafeName, StringSet &usedNames,
+    const char *suffix = "")
+{
+    static std::string safeName;
+    std::string baseSafeName = safeName = safeFileName(unsafeName, suffix);
+    int ndx = 0;
+    char ndxStr[64];
+    while (usedNames.end() != usedNames.find(safeName)) {
+        safeName = baseSafeName;
+        safeName += "-";
+        sprintf(ndxStr, "%d", ++ndx);
+        safeName += ndxStr;
+    }
+    usedNames.insert(safeName);
+    return safeName.c_str();
+}
+
+
+static bool
+getXYZ(PWGM_XYZVAL xyz[3], PWGM_HVERTEX vertex)
+{
+    return  PwVertXyzVal(vertex, PWGM_XYZ_X, &(xyz[0])) &&
+            PwVertXyzVal(vertex, PWGM_XYZ_Y, &(xyz[1])) &&
+            PwVertXyzVal(vertex, PWGM_XYZ_Z, &(xyz[2]));
+}
+
+
+static void
+createVector(PWGM_XYZVAL vector[3], const PWGM_XYZVAL xyzStart[3], 
+        const PWGM_XYZVAL xyzEnd[3])
+{
+    vector[0] = xyzEnd[0] - xyzStart[0];
+    vector[1] = xyzEnd[1] - xyzStart[1];
+    vector[2] = xyzEnd[2] - xyzStart[2];
+}
+
+
+static PWP_REAL
+calcLength(const PWGM_XYZVAL xyzStart[3], const PWGM_XYZVAL xyzEnd[3])
+{
+    const PWP_REAL dx = xyzEnd[0] - xyzStart[0];
+    const PWP_REAL dy = xyzEnd[1] - xyzStart[1];
+    const PWP_REAL dz = xyzEnd[2] - xyzStart[2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
 
@@ -115,6 +219,167 @@ needs to be inside the face. Faces are allowed to be warped, i.e. not all
 points of the face need to be coplanar. 
 
 */
+
+class GridValidator {
+public:
+
+    /****************************************************************************
+     * 
+     * The getGridProperties(CAEP_RTITEM) function, used locally.
+     * 
+     * getGridProperties(CAEP_RTITEM) This function calculates the 
+     * orientation of each domain based on the ordering of the points of the first 
+     * element of the block. This is necessary to determine the proper order to output
+     * the points for the triangles and quads as well as to decide the direction the z 
+     * component will be incremented. If any domain is not oriented the same way as 
+     * the first domain, a warning message is displayed to the user and the orientation
+     * is assumed to be the direction of the first domain.
+     * 
+     ***************************************************************************/
+    static void
+    getGridProperties(PWGM_HGRIDMODEL model, bool &isZPlanar,
+        PWGM_XYZVAL &planeZ, Orientation &orientation, bool &consistent)
+    {
+        PWGM_XYZVAL xyz0[3];
+        PWGM_XYZVAL xyz1[3];
+        PWGM_XYZVAL xyz2[3];
+        PWGM_XYZVAL vector1[3];
+        PWGM_XYZVAL vector2[3];
+        PWGM_HVERTEX vertex;
+        PWGM_HELEMENT element;
+        PWGM_HBLOCK block;
+        PWGM_ELEMDATA data = {PWGM_ELEMTYPE_SIZE};
+
+        // Using the first block for the direction of extrusion regardless of 
+        // the orientation of the other blocks.
+        block = PwModEnumBlocks(model, 0);
+        element = PwBlkEnumElements(block, 0);
+        PwElemDataMod(element, &data);
+
+        vertex = PwModEnumVertices(model, data.index[0]);
+        getXYZ(xyz0, vertex);
+        vertex = PwModEnumVertices(model, data.index[1]);
+        getXYZ(xyz1, vertex);
+
+        if (data.vertCnt == 4) {
+            // Element is a quad, the vertex to be used is the vertex right
+            // next to the 0th point i.e. point 3.
+            vertex = PwModEnumVertices(model, data.index[3]);
+            getXYZ(xyz2, vertex);
+        } 
+        else if (data.vertCnt == 3) {
+            // Element is a tri, the vertex to be used is the only other vertex
+            // remaining.
+            vertex = PwModEnumVertices(model, data.index[2]);
+            getXYZ(xyz2, vertex);
+        }
+    
+        createVector(vector1, xyz0, xyz1);
+        createVector(vector2, xyz0, xyz2);
+        orientation = calcZOrientation(vector1, vector2);
+        isConsistent(model, orientation, consistent);
+        isPlanar(model, isZPlanar, planeZ);
+    }
+
+
+private:
+
+    /**************************************************************************
+    * The orientation of the block is determined by the value of the z comp
+    * This is done using the formula:
+    * <cx, cy, cz> = < ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bx >
+    * because the z component is the only required calculation, the third part 
+    * of the formula is the only part being calculated.
+    *************************************************************************/
+    static Orientation 
+    calcZOrientation(PWGM_XYZVAL vector1[3], PWGM_XYZVAL vector2[3])
+    {
+        const PWGM_XYZVAL orientationCheck = vector1[0] * vector2[1] -
+            vector1[1] * vector2[0];
+        return (orientationCheck > 0) ? PositiveZ : NegativeZ;
+    }
+
+
+    /**************************************************************************
+    * This function verifies if the domains of each block is oriented the same
+    * way. This is done by performing a vector cross product inside of each
+    * block and comparing that with the orientation of the first block.
+    **************************************************************************/
+    static void
+    isConsistent(PWGM_HGRIDMODEL model, const Orientation masterOrientation,
+        bool &consistent)
+    {
+        PWP_UINT32 i;
+        PWGM_XYZVAL xyz0[3], xyz1[3], xyz2[3];
+        PWGM_XYZVAL vector1[3], vector2[3];
+        PWP_UINT32 numBlocks = PwModBlockCount(model);
+        PWGM_HVERTEX vertex;
+        PWGM_HELEMENT element;
+        PWGM_ELEMDATA data = {PWGM_ELEMTYPE_SIZE};
+        PWGM_HBLOCK block;
+
+        consistent = true;
+        for (i=1; i < numBlocks; i++) {
+            block = PwModEnumBlocks(model, i);
+            element = PwBlkEnumElements(block, 0);
+            PwElemDataMod(element, &data);
+
+            vertex = PwModEnumVertices(model, data.index[0]);
+            getXYZ(xyz0, vertex);
+            vertex = PwModEnumVertices(model, data.index[1]);
+            getXYZ(xyz1, vertex);
+
+            if (data.vertCnt == 4) {
+                vertex = PwModEnumVertices(model, data.index[3]);
+                getXYZ(xyz2, vertex);
+            }
+            else if (data.vertCnt == 3) {
+                vertex = PwModEnumVertices(model, data.index[2]);
+                getXYZ(xyz2, vertex);
+            }
+            createVector(vector1, xyz0, xyz1);
+            createVector(vector2, xyz0, xyz2);
+            // Check to see if this block is oriented the same way as the first
+            // block.
+            if (masterOrientation != calcZOrientation(vector1, vector2)) {
+                consistent = false;
+                break;
+            }
+        }
+    }
+    
+
+    /**************************************************************************
+    * This function verifies if a grid is planar in the xy-plane. This is done
+    * by checking the value of the first point with all other points and
+    * comparing that value with the value of the grid tolerance.
+    **************************************************************************/
+    static void
+    isPlanar(PWGM_HGRIDMODEL model, bool &isZPlanar, PWGM_XYZVAL &planeZ)
+    {
+        PWP_REAL gridPtTol;
+        PwModGetAttributeREAL(model, "GridPointTol", &gridPtTol);
+        PWP_UINT32 index = 0;
+        PWGM_VERTDATA masterPt;
+        if (!PwVertDataMod(PwModEnumVertices(model, index), &masterPt)) {
+            // someting very bad just happened
+            isZPlanar = false;
+            planeZ = 0.0;
+        }
+        else {
+            PWGM_VERTDATA vData;
+            planeZ = masterPt.z;
+            isZPlanar = true;
+            while (PwVertDataMod(PwModEnumVertices(model, ++index), &vData)) {
+                const PWGM_XYZVAL dz = planeZ - vData.z;
+                if (fabs(dz) > gridPtTol) {
+                    isZPlanar = false;
+                    break;
+                }
+            }
+        }
+    }
+};
 
 
 /***************************************************************************
@@ -182,8 +447,8 @@ public:
     // close the file
     void close()
     {
-        sysFILEPOS savePos;
         if (0 != fp_) {
+            sysFILEPOS savePos;
             if (getSetFilePos(savePos, pos_)) {
                 fprintf(fp_, "%*lu\n", -FldWd, (unsigned long)numItems_);
                 pwpFileSetpos(fp_, &savePos);
@@ -278,8 +543,9 @@ private:
 class FoamPointFile : public FoamFile {
 public:
     // Default constructor, set class name and file name
-    FoamPointFile() :
-        FoamFile("vectorField", "points")
+    FoamPointFile(PWP_UINT prec) :
+        FoamFile("vectorField", "points"),
+        prec_(prec)
     {
     }
 
@@ -288,22 +554,43 @@ public:
     {
     }
 
+
     // write vertex to points file, one per line
     // (x y z)
-    void writeVertex(const PWGM_VERTDATA &v)
+    inline void
+    writeVertex(const PWGM_VERTDATA &v)
     {
-        fprintf(*this, "(%.12g %.12g %.12g)\n", v.x, v.y, v.z);
+        const int p = (int)prec_;
+        fprintf(*this, "(%.*g %.*g %.*g)\n", p, v.x, p, v.y, p, v.z);
         incrNumItems();
     }
 
+
     // write global vertex to points file
-    void writeVertex(const PWGM_HVERTEX h)
+    inline void
+    writeVertex(const PWGM_HVERTEX h)
     {
         PWGM_VERTDATA v;
         if (PwVertDataMod(h, &v)) {
             writeVertex(v);
         }
     }
+
+
+    // write global vertex to points file
+    void writeVertex(const PWGM_HVERTEX h, const PWGM_XYZVAL newZ)
+    {
+        PWGM_VERTDATA v;
+        if (PwVertDataMod(h, &v)) {
+            v.z = newZ;
+            writeVertex(v);
+        }
+    }
+
+
+private:
+
+    PWP_UINT    prec_;
 };
 
 
@@ -316,8 +603,10 @@ public:
 class FoamFacesFile : public FoamFile {
 public:
     // Default constructor, set class and file name
-    FoamFacesFile() :
-        FoamFile("faceList", "faces")
+    FoamFacesFile(bool is2D, PWP_UINT32 vertexCount) :
+        FoamFile("faceList", "faces"),
+        is2D_(is2D),
+        vertexCount_(vertexCount)
     {
     }
 
@@ -341,24 +630,47 @@ public:
         switch (eData.type) {
         case PWGM_ELEMTYPE_QUAD:
             fprintf(*this, "%lu(%lu %lu %lu %lu)\n",
-                (unsigned long)eData.vertCnt, (unsigned long)eData.index[3],
-                (unsigned long)eData.index[2], (unsigned long)eData.index[1],
+                (unsigned long)eData.vertCnt, 
+                (unsigned long)eData.index[3],
+                (unsigned long)eData.index[2], 
+                (unsigned long)eData.index[1],
                 (unsigned long)eData.index[0]);
             incrNumItems();
             break;
         case PWGM_ELEMTYPE_TRI:
-            fprintf(*this, "%lu(%lu %lu %lu)\n", (unsigned long)eData.vertCnt,
-                (unsigned long)eData.index[2], (unsigned long)eData.index[1],
+            fprintf(*this, "%lu(%lu %lu %lu)\n", 
+                (unsigned long)eData.vertCnt,
+                (unsigned long)eData.index[2], 
+                (unsigned long)eData.index[1],
                 (unsigned long)eData.index[0]);
             incrNumItems();
             break;
         case PWGM_ELEMTYPE_BAR:
-            fprintf(*this, "%lu(%lu %lu)\n", (unsigned long)eData.vertCnt,
-                (unsigned long)eData.index[1], (unsigned long)eData.index[0]);
-            incrNumItems();
+            if (is2D_) {
+                fprintf(*this, "%lu(%lu %lu %lu %lu)\n",
+                    (unsigned long)eData.vertCnt + 2,
+                    (unsigned long)eData.index[0],
+                    (unsigned long)eData.index[1],
+                    (unsigned long)eData.index[1] + vertexCount_,
+                    (unsigned long)eData.index[0] + vertexCount_);
+                incrNumItems();
+            }
+            else {
+                fprintf(*this, "%lu(%lu %lu)\n", 
+                    (unsigned long)eData.vertCnt,
+                    (unsigned long)eData.index[1], 
+                    (unsigned long)eData.index[0]);
+                incrNumItems();
+            }
+            break;
+        default:
             break;
         }
     }
+
+private:
+    PWP_UINT32  vertexCount_;     // Total number of vertices in file
+    PWP_BOOL    is2D_;            // Is the file 2D?
 };
 
 
@@ -783,10 +1095,8 @@ public:
         const char *sfxIFaces = "-interiorFaces";
         const char *sfxBFaces = "-boundaryFaces";
         const char *sfxFaces = "-faces";
-
         // make "./sets" the current directory
         pwpCwdPush("sets");
-
         // allocate sets per vc.tid
         if (VcIBFaces == (VcIBFaces & vc.tid)) {
             // interior and boundary faces go to different set files
@@ -823,7 +1133,6 @@ public:
             cellSetFile_->open(uniqueSafeFileName(vc.name, usedNames,
                 "-cells"));
         }
-
         pwpCwdPop();
     }
 
@@ -845,7 +1154,7 @@ public:
     }
 
     // write a boundary, connection or interior face
-    void pushFace(PWGM_ENUM_FACETYPE type, PWP_UINT32 face)
+    void addFace(PWGM_ENUM_FACETYPE type, PWP_UINT32 face)
     {
         switch (type) {
         case PWGM_FACETYPE_BOUNDARY:
@@ -858,6 +1167,8 @@ public:
             if (0 != internalFaceSetFile_) {
                 internalFaceSetFile_->writeAddress(face);
             }
+            break;
+        default:
             break;
         }
     }
@@ -916,7 +1227,7 @@ public:
     }
 
     // delete face set file(s)
-    void deleteFaceSets()
+    void deleteFaceSetFiles()
     {
         finalizeFaceSets();
         if (0 != internalFaceSetFile_) {
@@ -937,49 +1248,12 @@ public:
     }
 
     // delete cell set file
-    void deleteCellSets()
+    void deleteCellSetFiles()
     {
         finalizeCellSet();
         if (0 != cellSetFile_) {
             deleteSetFile(cellSetFile_->object());
         }
-    }
-
-    // return a sanitized file name
-    static const char *
-    safeFileName(const char *unsafeName, const char *suffix = "")
-    {
-        const std::string safeChars("-_.");
-        static std::string safeName;
-        safeName = unsafeName;
-        std::string::iterator it = safeName.begin();
-        for (; it != safeName.end(); ++it) {
-            // replace invalid characters in the file name with underscore
-            if (!isalnum(*it) && (std::string::npos == safeChars.find(*it))) {
-                *it = '_';
-            }
-        }
-        safeName += suffix;
-        return safeName.c_str();
-    }
-
-    // return a unique sanitized file name
-    static const char *
-    uniqueSafeFileName(const char *unsafeName, StringSet &usedNames,
-        const char *suffix = "")
-    {
-        static std::string safeName;
-        std::string baseSafeName = safeName = safeFileName(unsafeName, suffix);
-        int ndx = 0;
-        char ndxStr[64];
-        while (usedNames.end() != usedNames.find(safeName)) {
-            safeName = baseSafeName;
-            safeName += "-";
-            sprintf(ndxStr, "%d", ++ndx);
-            safeName += ndxStr;
-        }
-        usedNames.insert(safeName);
-        return safeName.c_str();
     }
 
 private:
@@ -994,11 +1268,11 @@ private:
     FoamCellSetFile *cellSetFile_;          // cell set file or null
 };
 
-typedef std::vector<VcSetFiles *> VcSetFilesVec;
-
-
-static const char *FaceExport   = "FaceExport";
-static const char *CellExport   = "CellExport";
+// Domains are agglomerated by the core. Only need a simple, 1-to-1 mapping from
+// the non-inflated domain's id to the face set file.
+typedef std::map<PWP_UINT32, FoamFaceSetFile>   DomIdFaceSetFileMap;
+typedef std::vector<VcSetFiles *>               VcSetFilesVec;
+typedef std::vector<std::string *>              BcSetFileNames;
 
 
 /***************************************************************************
@@ -1012,8 +1286,7 @@ public:
         rti_(*pRti),
         model_(model),
         writeInfo_(*pWriteInfo),
-
-        faces_(),
+        faces_(CAEPU_RT_DIM_2D(&rti_), PwModVertexCount(model_)),
         owner_(),
         neighbour_(),
         bcStats_(),
@@ -1022,14 +1295,28 @@ public:
         exportFaceZones_(false),
         exportCellSets_(false),
         exportCellZones_(true),
-
+        sideBcMode_(BcModeSingle),
         totElemCnt_(0),
-
         blkIdOffset_(),
-        vcNameOffset_(),
-        vcSetFiles_()
+        vcSetFiles_(),
+        bcSetFiles_(),
+        numFaces_(0),
+        curInflId_(PWP_UINT32_MAX),
+        nonInflBCSetFiles_(),
+        orientation_(UnknownZ),
+        planeZ_(0.0),
+        totalEdgeLength_(0.0),
+        doThicknessCalc_(false),
+        thickness_(ThicknessDef),
+        doFaceSets_(false),
+        setsDirWasCreated_(false)
     {
+        if (!PwModGetAttributeREAL(model_, Thickness, &thickness_)) {
+            thickness_ = ThicknessDef;
+        }
+        doThicknessCalc_ = CAEPU_RT_DIM_2D(&rti_) && (0.0 == thickness_);
     }
+
 
     // destructor
     ~OpenFoamPlugin()
@@ -1041,9 +1328,24 @@ public:
         vcSetFiles_.clear();
     }
 
+
     // main entry point for CAE export
     PWP_BOOL run()
     {
+        if (CAEPU_RT_DIM_2D(&rti_)) {
+            PwModAppendEnumElementOrder(model_, PWGM_ELEMORDER_VC);
+            bool isZPlanar;
+            bool isConsistent;
+            GridValidator::getGridProperties(model_, isZPlanar, planeZ_,
+                orientation_, isConsistent);
+            if (!isZPlanar) {
+                caeuSendErrorMsg(&rti_, "The grid is not Z-planar.", 0);
+                return PWP_FALSE;
+            } else if (!isConsistent) {
+                caeuSendErrorMsg(&rti_, "The grid has inconsistent normals.", 0);
+                return PWP_FALSE;
+            }
+        }
         // None|SetsOnly|ZonesOnly|SetsAndZones
         //    0|       1|        2|           3
 
@@ -1057,32 +1359,36 @@ public:
         exportFaceSets_  = (0 != (faceExport & 1));
         exportFaceZones_ = (0 != (faceExport & 2));
 
+        PWP_UINT sideBCExport = BcModeSingle;
+        PwModGetAttributeUINT(model_, SideBCExport, &sideBCExport);
+        sideBcMode_ = static_cast<SideBcMode>(sideBCExport);
+
         PWP_BOOL ret = PWP_FALSE;
-        bool wasCreated = false;
         PWP_UINT32 majorSteps = 3 + (exportCellZones_ ? 1 : 0);
 
         if (!caeuProgressInit(&rti_, majorSteps)) {
         }
-        else if (needSetsDir() && !createSetsDir(wasCreated)) {
-            caeuSendErrorMsg(&rti_, "Could not create 'sets' directory!", 0);
+        else if (needSetsDir() && !createSetsDir()) {
+            caeuSendErrorMsg(&rti_, "Could not create 'sets' directory.", 0);
         }
         else if (needSetsDir() && !prepareVcSetFiles()) {
-            caeuSendErrorMsg(&rti_, "Could prepare VC set files!", 0);
-        }
-        else if (!processPoints()) {
-            caeuSendErrorMsg(&rti_, "Could not write points!", 0);
+            caeuSendErrorMsg(&rti_, "Could prepare VC set files.", 0);
         }
         else if (!processFaces()) {
-            caeuSendErrorMsg(&rti_, "Could not write face files!", 0);
+            caeuSendErrorMsg(&rti_, "Could not write face files.", 0);
+        }
+        else if (!processPoints()) {
+            caeuSendErrorMsg(&rti_, "Could not write points file.", 0);
         }
         else if (!processCells()) {
-            caeuSendErrorMsg(&rti_, "Could not write cell sets!", 0);
+            caeuSendErrorMsg(&rti_, "Could not write cell sets.", 0);
         }
         else {
             ret = PWP_TRUE;
         }
 
-        if (wasCreated && !exportingAnySets()) {
+        if (setsDirWasCreated_) {
+            // Attempt to delete. Will fail if dir contains any files.
             pwpDeleteDir("sets");
         }
 
@@ -1090,7 +1396,9 @@ public:
         return ret;
     }
 
+
 private:
+
     // Accumulate boundary face group information. Data is written to
     // "boundary" file at end of export. This method assumes that the
     // faces are being streamed in boundary group order.
@@ -1098,6 +1406,16 @@ private:
     {
         PWGM_CONDDATA condData;
         if (PwDomCondition(data.owner.domain, &condData)) {
+            pushBcFace(condData, data.face);
+        }
+    }
+
+
+    // Accumulate boundary face group information. Data is written to
+    // "boundary" file at end of export. This method assumes that the
+    // faces are being streamed in boundary group order.
+    void pushBcFace(const PWGM_CONDDATA &condData, PWP_UINT32 faceId)
+    {
             if ((0 == bcStats_.size()) ||
                     (0 != bcStats_.back().name_.compare(condData.name))) {
                 // we are starting a new BC group
@@ -1105,7 +1423,7 @@ private:
                 stats.name_ = condData.name;
                 stats.type_ = condData.type;
                 stats.nFaces_ = 1;
-                stats.startFace_ = data.face;
+            stats.startFace_ = faceId;
                 bcStats_.push_back(stats);
             }
             else {
@@ -1113,7 +1431,7 @@ private:
                 ++bcStats_.back().nFaces_;
             }
         }
-    }
+
 
     // Return whether the "sets" directory is needed during this export
     bool needSetsDir() const {
@@ -1121,28 +1439,40 @@ private:
             exportFaceZones_;
     }
 
+
     // Return whether any cell sets or face sets are being exported
     bool exportingAnySets() const {
         return exportCellSets_ || exportFaceSets_;
     }
+
 
     // Return whether face sets are needed for this export
     bool faceSetsNeeded() {
         return (exportFaceZones_ || exportFaceSets_) && !vcSetFiles_.empty();
     }
 
+
     // Return whether cell sets are needed for this export
     bool cellSetsNeeded() {
         return (exportCellSets_ || exportCellZones_) && !vcSetFiles_.empty();
     }
 
+
     // Obtain and write all the global vertices in the exported mesh system
     bool processPoints()
     {
+        PWP_UINT prec;
+        if (!PwModGetAttributeUINT(model_, PointPrecision, &prec)) {
+            prec = PointPrecisionDef;
+        }
         bool ret = false;
-        PWP_UINT32 numPts = PwModVertexCount(model_);
-        FoamPointFile points;
-        if (progressBeginStep(numPts) && points.open()) {
+        const bool is2D = (0 != CAEPU_RT_DIM_2D(&rti_));
+        const PWP_UINT32 numPts = PwModVertexCount(model_);
+        FoamPointFile points(prec);
+        if (is2D && (UnknownZ == orientation_)) {
+            // not good
+        }
+        else if (progressBeginStep(numPts * (is2D ? 2 : 1)) && points.open()) {
             ret = true;
             for (PWP_UINT32 ii = 0; ii < numPts; ++ii) {
                 points.writeVertex(PwModEnumVertices(model_, ii));
@@ -1151,10 +1481,23 @@ private:
                     break;
                 }
             }
+            if (ret && is2D) {
+                // Create a second set of points for a single cell thick
+                // extrusion. Thickened points are on the newZ plane.
+                const PWGM_XYZVAL newZ = planeZ_ + (orientation_ * thickness_);
+                for (PWP_UINT32 ii = 0; ii < numPts; ++ii) {
+                    points.writeVertex(PwModEnumVertices(model_, ii), newZ);
+                    if (!progressIncr()) {
+                        ret = false;
+                        break;
+                    }
+                }
+            }
         }
         progressEndStep();
         return ret;
     }
+
 
     // Callback from plugin API when face streaming is about to begin
     static PWP_UINT32 streamBegin(PWGM_BEGINSTREAM_DATA *data)
@@ -1163,11 +1506,16 @@ private:
             return PWP_FALSE;
         }
         OpenFoamPlugin &ofp = *((OpenFoamPlugin*)data->userData);
+        ofp.numFaces_ = data->totalNumFaces;
+        ofp.doFaceSets_ = ofp.faceSetsNeeded();
+        ofp.totalEdgeLength_ = 0.0;
+
         // Open the faces, owner, and neighbour export files. They are all
         // written in parallel as faces stream into faceStreamCB().
         return ofp.progressBeginStep(data->totalNumFaces) &&
                ofp.faces_.open() && ofp.owner_.open() && ofp.neighbour_.open();
     }
+
 
     // Callback from plugin API to write a cell face
     static PWP_UINT32 streamFace(PWGM_FACESTREAM_DATA *data)
@@ -1193,12 +1541,177 @@ private:
             ofp.neighbour_.writeAddress(data->neighborCellIndex);
         }
 
-        if (ofp.faceSetsNeeded()) {
-            ofp.pushFace(*data);
+        if ((ofp.exportFaceSets_ || ofp.exportFaceZones_) &&
+            (PWGM_FACETYPE_CONNECTION == data->type) &&
+            PWGM_HDOMAIN_ISVALID(data->owner.domain)) {
+            // This face belongs to a non-inflatable face set.
+            const PWP_UINT32 id = PWGM_HDOMAIN_ID(data->owner.domain);
+            DomIdFaceSetFileMap &fsFiles = ofp.nonInflBCSetFiles_;
+            FoamFaceSetFile *fsf = 0;
+            DomIdFaceSetFileMap::iterator nit = fsFiles.find(id);
+            if (fsFiles.end() != nit) {
+                // face set file for id already exists - use it
+                fsf = &(nit->second);
+            }
+            else if (!ofp.createSetsDir()) {
+                fsf = 0; // BAD
+            }
+            else if (0 == pwpCwdPush("sets")) {
+                // "./sets" is now the cwd. Create new face set file for id
+                DomIdFaceSetFileMap::value_type val(id, FoamFaceSetFile());
+                PWGM_CONDDATA condData;
+                if (!PwDomCondition(data->owner.domain, &condData)) {
+                    fsf = 0; // BAD
+                }
+                else if (fsFiles.end() == (nit = fsFiles.insert(val).first)) {
+                    fsf = 0; // BAD
+                }
+                else if (!nit->second.open(uniqueSafeFileName(condData.name,
+                    ofp.usedFileNames_))) {
+                    fsf = 0; // BAD
+                }
+                else {
+                    fsf = &(nit->second);
+                }
+                pwpCwdPop();
+            }
+            if (0 != fsf) {
+                // add face to appropriate non-inflatable face set.
+                fsf->writeAddress(data->face);
+            }
+            else {
+                caeuSendErrorMsg(&ofp.rti_, "Could not create faceSet.", 0);
+                return 0;
+            }
+        }
+
+        if (ofp.doFaceSets_) {
+            ofp.addFaceToSet(*data);
+        }
+
+        if (ofp.doThicknessCalc_) {
+            // Compute the edge's length and add it to the total.
+            PWGM_XYZVAL xyz0[3];
+            PWGM_XYZVAL xyz1[3];
+            if (getXYZ(xyz0, data->elemData.vert[0]) &&
+                    getXYZ(xyz1, data->elemData.vert[1])) {
+                ofp.totalEdgeLength_ += calcLength(xyz0, xyz1);
+            }
         }
 
         return ofp.progressIncr();
     }
+
+
+    void offsetVertices(PWP_UINT32 offset, PWGM_ELEMDATA &elemData)
+    {
+        elemData.index[0] += offset;
+        elemData.index[1] += offset;
+        elemData.index[2] += offset;
+        switch (elemData.type){
+        case PWGM_ELEMTYPE_QUAD:
+            elemData.index[3] += offset;
+            std::swap(elemData.index[0], elemData.index[3]);
+            std::swap(elemData.index[1], elemData.index[2]);
+            break;
+        case PWGM_ELEMTYPE_TRI:
+            std::swap(elemData.index[0], elemData.index[2]);
+            break;
+        default:
+            break;
+        }
+    }
+
+
+    void writeFaces()
+    {
+        PWP_UINT32 faceOffset = numFaces_;
+        PWP_UINT32 vertOffset = 0;
+        // write original tri/quads as boundary elements of the extruded grid
+        writeFaces(faceOffset, vertOffset);
+        // write offset tri/quads as boundary elements of the extruded grid
+        faceOffset += PwModEnumElementCount(model_, 0);
+        vertOffset += PwModVertexCount(model_);
+        writeFaces(faceOffset, vertOffset);
+    }
+
+
+    void getElementCond(const PWP_UINT32 blkId, PWGM_CONDDATA &cond,
+        const bool isOffset, PWP_UINT32 &prevBlkId)
+    {
+        static const char *EmptyType = "empty";
+        static const PWP_UINT32 EmptyTid = 103;
+        if (blkId != prevBlkId) {
+            prevBlkId = blkId;
+            PWGM_HBLOCK hBlk;
+            PWGM_HBLOCK_SET(hBlk, model_, blkId);
+            // Use the 2D block's VC as base for the extruded side BCs
+            if (!PwBlkCondition(hBlk, &cond)) {
+                cond = UnspecifiedCond;
+            }
+            switch (sideBcMode_) {
+            case BcModeUnspecified:
+                cond = UnspecifiedCond;
+                break;
+            case BcModeBaseTop:
+                cond.name = (isOffset ? "Top" : "Base");
+                cond.type = EmptyType;
+                cond.tid = EmptyTid;
+                break;
+            case BcModeMultiple: {
+                static std::string bcName;
+                bcName = cond.name;
+                bcName += (isOffset ? "-top" : "-base");
+                // cond.name ptr only valid until next call to getElementCond()
+                cond.name = bcName.c_str();
+                cond.type = EmptyType;
+                cond.tid = EmptyTid;
+                break; }
+            case BcModeSingle:
+            default:
+                cond.name = "BaseAndTop";
+                cond.type = EmptyType;
+                cond.tid = EmptyTid;
+                break;
+            }
+        }
+    }
+
+
+    void writeFaces(const PWP_UINT32 faceOffset, const PWP_UINT32 vertOffset)
+    {
+        const bool isOffset = (0 < vertOffset);
+        PWGM_CONDDATA bc = { 0 };
+        PWP_UINT32 prevBlkId = PWP_UINT32_MAX;
+        PWGM_ENUMELEMDATA eData = {};
+        PWP_UINT32 index = 0;
+        PWGM_HELEMENT hElem = PwModEnumElements(model_, index);
+        while (PwElemDataModEnum(hElem, &eData)) {
+            if (isOffset) {
+                // This element is an offset of an original element
+                offsetVertices(vertOffset, eData.elemData);
+            }
+            // Add the face
+            faces_.writeFace(eData.elemData);
+            // This 2D tri/quad element is extruded to a 3D element prism/hex
+            // element with the same id as the 2D element. This cell id is the
+            // face's owner.
+            owner_.writeAddress(PWGM_HELEMENT_ID(hElem));
+            // getElementCond() will update bc when blkId changes
+            const PWP_UINT32 blkId = PWGM_HELEMENT_PID(eData.hBlkElement);
+            getElementCond(blkId, bc, isOffset, prevBlkId);
+            // The face id follows cell id with an offset
+            const PWP_UINT32 faceId = PWGM_HELEMENT_ID(hElem) + faceOffset;
+            pushBcFace(bc, faceId);
+            if (doFaceSets_) {
+                // Add this boundary element (tri/quad) to the face set of the
+                // volume it touches.
+                addBndryFaceToSet(blkId, faceId);
+            }
+            hElem = PwModEnumElements(model_, ++index);
+        }
+    }
+
 
     // Callback from plugin API when face streaming has completed
     static PWP_UINT32 streamEnd(PWGM_ENDSTREAM_DATA *data)
@@ -1207,27 +1720,55 @@ private:
             return PWP_FALSE;
         }
         OpenFoamPlugin &ofp = *((OpenFoamPlugin*)data->userData);
+        DomIdFaceSetFileMap::iterator nit;
+        nit = ofp.nonInflBCSetFiles_.begin();
+        for (; nit != ofp.nonInflBCSetFiles_.end(); ++nit) {
+            nit->second.close();
+        }
+        if (CAEPU_RT_DIM_2D(&ofp.rti_)) {
+            ofp.writeFaces();
+        }
         FoamBoundaryFile boundary;
         if (boundary.open()) {
             // Flush the accumulated BC information to the boundary file.
             boundary.writeBoundaries(ofp.bcStats_);
         }
+        if (ofp.doThicknessCalc_ && (0 < ofp.numFaces_)) {
+            // Set thickness_ to the 2D grid's average edge length. Remember,
+            // for 2D grids, ofp.numFaces_ is the number of 2D cell edges that
+            // were streamed.
+            ofp.thickness_ = ofp.totalEdgeLength_ / ofp.numFaces_;
+            std::ostringstream oss;
+            oss << "2D Thickness set to " << ofp.thickness_;
+            // Let user know!
+            caeuSendInfoMsg(&ofp.rti_, oss.str().c_str(), 0);
+        }
         return ofp.progressEndStep();
     }
 
+
     // create the sets directory
-    bool createSetsDir(bool &wasCreated)
+    bool createSetsDir()
     {
         bool ret = true;
-        if (0 != pwpCreateDir("sets")) {
-            wasCreated = false;
-            ret = (EEXIST == errno);
+        if (0 == pwpCreateDir("sets")) {
+            // A new dir was created - all is OK. Only set setsDirWasCreated_ to
+            // true if dir was actually created so that createSetsDir() can be
+            // called multiple times.
+            setsDirWasCreated_ = true;
+        }
+        else if (EEXIST == errno) {
+            // If it already existed, all is OK
+            ret = true;
         }
         else {
-            wasCreated = true;
+            // Could not create dir
+            ret = false;
         }
+        // returns true if sets dir is available
         return ret;
     }
+
 
     // process the cell faces using the face streaming plugin API
     bool processFaces()
@@ -1254,11 +1795,17 @@ private:
             // dont need face set files anymore, delete them
             VcSetFilesVec::iterator it = vcSetFiles_.begin();
             for (; it != vcSetFiles_.end(); ++it) {
-                (*it)->deleteFaceSets();
+                (*it)->deleteFaceSetFiles();
+            }
+            DomIdFaceSetFileMap::const_iterator nit;
+            nit = nonInflBCSetFiles_.begin();
+            for (; nit != nonInflBCSetFiles_.end(); ++nit) {
+                VcSetFiles::deleteSetFile(nit->second.object());
             }
         }
         return ret;
     }
+
 
     // process the cell sets
     bool processCells()
@@ -1276,7 +1823,7 @@ private:
                     // dont need cell set file anymore, delete them
                     VcSetFilesVec::iterator it = vcSetFiles_.begin();
                     for (; it != vcSetFiles_.end(); ++it) {
-                        (*it)->deleteCellSets();
+                        (*it)->deleteCellSetFiles();
                     }
                 }
             }
@@ -1286,6 +1833,7 @@ private:
         }
         return ret;
     }
+
 
     // write cell set files
     bool writeCellSetFiles()
@@ -1352,6 +1900,7 @@ private:
         return ret;
     }
 
+
     // write the cell zones file
     void writeCellZonesFile()
     {
@@ -1372,6 +1921,7 @@ private:
         progressEndStep();
     }
 
+
     // build VC sets
     bool prepareVcSetFiles()
     {
@@ -1381,36 +1931,39 @@ private:
         // For each unique VC name:
         //  Create a VcSetFiles object.
         //  Make a blkIdOffset_ mapping.
-        //  Make a vcNameOffset_ mapping.
         //  Keep a tally of the number of cells.
         //  Track the max index value.
         PWP_UINT32 blkId = 0;
         CharPtrUInt32Map::iterator iter;
         PWGM_CONDDATA vc;
         PWP_UINT32 offset = 0;
+        // Becasue blocks are not agglomerated, there is a many-to-one
+        // relationship between blocks and VC set files (multiple blocks can map
+        // to one VC set file). Use vcNameOffset to maintain the 1-to-1
+        // VC-to-vcSetFile mapping.
+        CharPtrUInt32Map vcNameOffset; // vc name to a vcSetFiles_ index
         PWGM_HBLOCK block = PwModEnumBlocks(model_, blkId);
         while (PwBlkCondition(block, &vc)) {
-            if (!isUnspecifiedVc(vc)) {
-                // Check if vc mapping exists
-                iter = vcNameOffset_.find(vc.name);
-                if (vcNameOffset_.end() == iter) {
-                    // first time for this VC name - allocate a new file
-                    offset = (PWP_UINT32)vcSetFiles_.size();
-                    vcNameOffset_[vc.name] = offset;
-                    VcSetFiles *vcset = new VcSetFiles(vc, usedFileNames_);
-                    vcSetFiles_.push_back(vcset);
-                }
-                else {
-                    // VC already mapped - use existing file
-                    offset = iter->second;
-                }
-                blkIdOffset_[blkId] = offset;
-                totElemCnt_ += PwBlkElementCount(block, 0);
+            // Check if vc mapping exists
+            iter = vcNameOffset.find(vc.name);
+            if (vcNameOffset.end() == iter) {
+                // first time for this VC name - allocate a new file
+                offset = (PWP_UINT32)vcSetFiles_.size();
+                vcNameOffset[vc.name] = offset;
+                VcSetFiles *vcset = new VcSetFiles(vc, usedFileNames_);
+                vcSetFiles_.push_back(vcset);
             }
+            else {
+                // VC already mapped - use existing file
+                offset = iter->second;
+            }
+            blkIdOffset_[blkId] = offset;
+            totElemCnt_ += PwBlkElementCount(block, 0);
             block = PwModEnumBlocks(model_, ++blkId); // next block
         }
         return true;
     }
+
 
     // Change face type from connection to interior when owner and neighbor
     // cells (which come from different blocks) but have the same volume
@@ -1438,15 +1991,12 @@ private:
         return ret;
     }
 
+
     // store a cell face during face streaming
-    void pushFace(const PWGM_FACESTREAM_DATA &data)
+    void addFaceToSet(const PWGM_FACESTREAM_DATA &data)
     {
         PWGM_ENUM_FACETYPE faceType = adjustFaceType(data);
-        PWP_UINT32 blkId = PWGM_HBLOCK_ID(data.owner.block);
-        PWP_UINT32 offset = blkIdOffset_[blkId];
-        VcSetFiles *vcFiles = vcSetFiles_.at(offset);
-        vcFiles->pushFace(faceType, data.face);
-
+        addFaceToSet(PWGM_HBLOCK_ID(data.owner.block), faceType, data.face);
         // A connection face has different VCs on either side.
         // Must also push face to neighbor's VcSetFiles
         PWGM_ENUMELEMDATA eData;
@@ -1455,19 +2005,34 @@ private:
             PWP_UINT32 neighborBlkId = PWGM_HELEMENT_PID(eData.hBlkElement);
             PWP_UINT32 neighborOffset = blkIdOffset_[neighborBlkId];
             VcSetFiles *neighborVcFiles = vcSetFiles_.at(neighborOffset);
-            neighborVcFiles->pushFace(faceType, data.face);
+            neighborVcFiles->addFace(faceType, data.face);
         }
     }
+
+
+    void addFaceToSet(const PWP_UINT32 blkId, PWGM_ENUM_FACETYPE faceType, 
+        PWP_UINT32 face)
+    {
+        PWP_UINT32 offset = blkIdOffset_[blkId];
+        VcSetFiles *vcFiles = vcSetFiles_.at(offset);
+        vcFiles->addFace(faceType, face);
+    }
+
+
+    void addBndryFaceToSet(const PWP_UINT32 blkId, PWP_UINT32 face)
+    {
+        addFaceToSet(blkId, PWGM_FACETYPE_BOUNDARY, face);
+    }
+
 
     // write the face zones to the face sets files
     void writeFaceZonesFile()
     {
         finalizeFaceSets();
+        const PWP_UINT32 stepCnt = (PWP_UINT32)(vcSetFiles_.size() +
+            nonInflBCSetFiles_.size());
         FoamFaceZoneFile faceZones;
-        if (!progressBeginStep((PWP_UINT32)vcSetFiles_.size())) {
-            // aborted
-        }
-        else if (faceZones.open()) {
+        if (progressBeginStep(stepCnt) && faceZones.open()) {
             VcSetFilesVec::iterator it = vcSetFiles_.begin();
             for (; it != vcSetFiles_.end(); ++it) {
                 (*it)->addFaceSetsToZonesFile(faceZones);
@@ -1475,9 +2040,18 @@ private:
                     break;
                 }
             }
+            DomIdFaceSetFileMap::const_iterator nit;
+            nit = nonInflBCSetFiles_.begin();
+            for (; nit != nonInflBCSetFiles_.end(); ++nit) {
+                faceZones.writeSet(nit->second.object());
+                if (!progressIncr()) {
+                    break;
+                }
+            }
         }
         progressEndStep();
     }
+
 
     // close the face sets files
     void finalizeFaceSets()
@@ -1488,6 +2062,7 @@ private:
         }
     }
 
+
     // close the cell sets file
     void finalizeCellSets()
     {
@@ -1497,11 +2072,13 @@ private:
         }
     }
 
+
     // plugin API progress, initialize sequence of steps
     bool progressBeginStep(PWP_UINT32 steps)
     {
         return 0 != caeuProgressBeginStep(&rti_, steps);
     }
+
 
     // plugin API progress, advance to next progress step
     bool progressIncr()
@@ -1509,11 +2086,13 @@ private:
         return 0 != caeuProgressIncr(&rti_);
     }
 
+
     // plugin API progress, finish sequence of steps
     bool progressEndStep()
     {
         return 0 != caeuProgressEndStep(&rti_);
     }
+
 
     // hidden assignment operator
     OpenFoamPlugin& operator=(OpenFoamPlugin &)
@@ -1521,38 +2100,54 @@ private:
         return *this;
     }
 
+
     static bool isCellVc(const PWGM_CONDDATA &vc)
     {
         return 0 != (vc.tid & VcCells);
     }
+
 
     static bool isFaceVc(const PWGM_CONDDATA &vc)
     {
         return 0 != (vc.tid & VcFaces);
     }
 
+
     static bool isUnspecifiedVc(const PWGM_CONDDATA &vc)
     {
         return 0 == vc.tid;
     }
 
+
 private:
-    CAEP_RTITEM             &rti_;            // ref to runtimeWrite *pRti
-    PWGM_HGRIDMODEL         model_;           // same as runtimeWrite model
-    const CAEP_WRITEINFO    &writeInfo_;      // ref to runtimeWrite *pWriteInfo
-    FoamFacesFile           faces_;           // The mesh "faces" file
-    FoamOwnerFile           owner_;           // The mesh cell "owner" file
-    FoamNeighbourFile       neighbour_;       // The mesh cell "neighbour" file
-    BcStats                 bcStats_;         // cached BC stat data
-    StringSet               usedFileNames_;   // set of used VC set file names
-    bool                    exportFaceSets_;  // true if exporting face sets
-    bool                    exportFaceZones_; // true if exporting face zones
-    bool                    exportCellSets_;  // true if exporting cell sets
-    bool                    exportCellZones_; // true if exporting cell zones
-    PWP_UINT32              totElemCnt_;      // total # of cells in all blocks
-    UInt32UInt32Map         blkIdOffset_;     // blkId to a vcSetFiles_ index
-    CharPtrUInt32Map        vcNameOffset_;    // vc name to a vcSetFiles_ index
-    VcSetFilesVec           vcSetFiles_;      // vc file
+
+    CAEP_RTITEM          &rti_;              // ref to runtimeWrite *pRti
+    PWGM_HGRIDMODEL      model_;             // same as runtimeWrite model
+    const CAEP_WRITEINFO &writeInfo_;        // ref to runtimeWrite *pWriteInfo
+    FoamFacesFile        faces_;             // The mesh "faces" file
+    FoamOwnerFile        owner_;             // The mesh cell "owner" file
+    FoamNeighbourFile    neighbour_;         // The mesh cell "neighbour" file
+    BcStats              bcStats_;           // cached BC stat data
+    StringSet            usedFileNames_;     // set of used VC set file names
+    bool                 exportFaceSets_;    // true if exporting face sets
+    bool                 exportFaceZones_;   // true if exporting face zones
+    bool                 exportCellSets_;    // true if exporting cell sets
+    bool                 exportCellZones_;   // true if exporting cell zones
+    SideBcMode           sideBcMode_;        // side BC export setting
+    PWP_UINT32           totElemCnt_;        // total # of cells in all blocks
+    UInt32UInt32Map      blkIdOffset_;       // blkId to a vcSetFiles_ index
+    VcSetFilesVec        vcSetFiles_;        // vc file
+    BcSetFileNames       bcSetFiles_;        // bc face set file names
+    PWP_UINT32           numFaces_;          // Number of faces for 2D export
+    PWP_UINT32           curInflId_;         // current non-inflated dom id
+    DomIdFaceSetFileMap  nonInflBCSetFiles_; // the non-inflated face set files
+    Orientation          orientation_;       // 2D offset orientation
+    PWGM_XYZVAL          planeZ_;            // The 2D grid's Z-plane location
+    PWP_REAL             totalEdgeLength_;   // Sum of 2D edge lengths
+    bool                 doThicknessCalc_;   // true if 2D and thickness == 0
+    PWP_REAL             thickness_;         // The 2D extrusion thickness
+    bool                 doFaceSets_;        // true if writing face sets
+    bool                 setsDirWasCreated_; // set true if dir was created
 };
 
 
@@ -1585,6 +2180,10 @@ runtimeCreate(CAEP_RTITEM * /* pRti */)
 {
     PWP_BOOL ret = PWP_TRUE;
 
+    // The non-inflated BC types
+    const char * const ShadowTypes = "faceSet";
+    ret = ret && caeuAssignInfoValue("ShadowBcTypes", ShadowTypes, true);
+
     // None|SetsOnly|ZonesOnly|SetsAndZones
     //    0|       1|        2|           3
     //
@@ -1592,7 +2191,6 @@ runtimeCreate(CAEP_RTITEM * /* pRti */)
     //
     //   SetsAndZones = SetsOnly | ZonesOnly
     const char *SetZoneEnum = "None|Sets|Zones|SetsAndZones";
-
     ret = ret &&
           caeuPublishValueDefinition(CellExport, PWP_VALTYPE_ENUM,
             "SetsAndZones", "RW", "Controls the export of cell sets and zones",
@@ -1602,6 +2200,24 @@ runtimeCreate(CAEP_RTITEM * /* pRti */)
           caeuPublishValueDefinition(FaceExport, PWP_VALTYPE_ENUM,
             "SetsAndZones", "RW", "Controls the export of face sets and zones",
             SetZoneEnum);
+
+    // Let user control the decimal precision.
+    ret = ret &&
+        caeuPublishValueDefinition(PointPrecision, PWP_VALTYPE_INT,
+            PointPrecisionDefStr, "RW",
+            "Controls the export of face sets and zones", "4 16");
+
+    // Let user control the 2D grid thickening offset
+    ret = ret &&
+        caeuPublishValueDefinition(Thickness, PWP_VALTYPE_REAL,
+            ThicknessDefStr, "RW", "Offset distance for 2D export", "0.0 +Inf");
+
+    // Let user control the 2D BC assignments
+    const char *SideBCExportEnum = "Unspecified|Single|BaseTop|Multiple";
+    ret = ret &&
+          caeuPublishValueDefinition(SideBCExport, PWP_VALTYPE_ENUM,
+            "Single", "RW", "Controls how BCs are assigned to the top and "
+            "base boundaries for 2D export.", SideBCExportEnum);
 
     return ret;
 }
