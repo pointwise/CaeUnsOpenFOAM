@@ -103,7 +103,7 @@ not hesitate to send us git pull requests for your changes. We will evaluate
 your changes and integrate them as appropriate.
 
 
-[SDKdownload]: http://www.pointwise.com/plugins/#sdk_downloads
+[SDKdownload]: http://www.pointwise.com/plugins/html/index.html#sdk_downloads
 [SDKdocs]: http://www.pointwise.com/plugins
 [SDKsite.H]: http://www.pointwise.com/plugins/html/d6/d89/site_8h.html
 [SDKbuild]: http://www.pointwise.com/plugins/html/da/dde/build_cae_plugin.html
