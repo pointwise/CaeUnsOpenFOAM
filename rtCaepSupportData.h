@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (c) 2012-2016 Pointwise, Inc.
+ * Copyright (c) 2012-2018 Pointwise, Inc.
  * All rights reserved.
  *
  * This sample Pointwise plugin is not supported by Pointwise, Inc.

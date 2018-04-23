@@ -1,5 +1,8 @@
 ## Building the OpenFOAM Plugin
 
+These instructions have been updated for Plugin SDK v1.0 R11 for Pointwise 18.1.
+See previous versions of this README if using older SDK distibutions.
+
 To build the OpenFOAM plugin you must integrate the OpenFOAM source code into 
 your local PluginSDK installation. These instructions assume you have already 
 downloaded, installed, and [verified][SDKdocs] the 
@@ -24,27 +27,24 @@ is shorthand for `\some\long\path\to\your\install\of\PluginSDK`.
 
 ### Creating the OpenFOAM Plugin Project on Unix and Mac OS/X
    * `% cd PluginSDK`
-   * `% mkplugin -uns -c MyOpenFOAM`
+   * `% mkplugin -caeu -c MyOpenFOAM`
    * `% make CaeUnsMyOpenFOAM-dr`
 
 ### Building the OpenFOAM Plugin Project on Windows
 
 #### At the Command Prompt
  * `C:> cd PluginSDK`
- * `C:> mkplugin -uns -c MyOpenFOAM`
+ * `C:> mkplugin -caeu -c MyOpenFOAM`
  * `C:> exit`
 
-#### In Visual Studio 2012
+#### In Visual Studio 2015
 
  * Choose the *File &gt; Open &gt; Project/Solution...* menu
- * Select the file `PluginSDK\PluginSDK_vs2012.sln`
+ * Select the file `PluginSDK\PluginSDK_vs2015.sln`
  * In the *Solution Explorer* window
   * Right-click on the *Plugins* folder
   * Choose *Add &gt; Existing Project...* in the popup menu
   * Select `PluginSDK\src\plugins\CaeUnsMyOpenFOAM\CaeUnsMyOpenFOAM.vcxproj`
-  * Right-click on the *CaeUnsMyOpenFOAM* project
-  * Choose *Add Exisiting Item...* in the popup menu
-  * Select `PluginSDK\src\plugins\CaeUnsMyOpenFOAM\vctypes.h`
   * Right-click on the *CaeUnsMyOpenFOAM* project
   * Choose *Build* in the popup menu
 
@@ -76,6 +76,11 @@ to
 
 Save the file.
 
+If using Visual Studio 2015:
+  * Right-click on the *CaeUnsMyOpenFOAM* project
+  * Choose *Add Exisiting Item...* in the popup menu
+  * Select `PluginSDK\src\plugins\CaeUnsMyOpenFOAM\vctypes.h`
+
 You can now build the `CaeUnsMyOpenFOAM` plugin on your platform. If all 
 builds correctly, you now have a CaeUnsMyOpenFOAM plugin that is functionally 
 equivalent to the OpenFOAM plugin distributed with Pointwise. You are now ready 
@@ -101,4 +106,4 @@ your changes and integrate them as appropriate.
 [SDKdownload]: http://www.pointwise.com/plugins/#sdk_downloads
 [SDKdocs]: http://www.pointwise.com/plugins
 [SDKsite.H]: http://www.pointwise.com/plugins/html/d6/d89/site_8h.html
-[SDKbuild]: http://www.pointwise.com/plugins/html/dc/d7e/build_plugin_cae.html
+[SDKbuild]: http://www.pointwise.com/plugins/html/da/dde/build_cae_plugin.html

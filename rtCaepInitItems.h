@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (c) 2012-2016 Pointwise, Inc.
+ * Copyright (c) 2012-2018 Pointwise, Inc.
  * All rights reserved.
  *
  * This sample Pointwise plugin is not supported by Pointwise, Inc.
@@ -29,7 +29,7 @@
         "OpenFOAM",                /* const char *name */
         MAKEGUID(ID_CaeOpenFOAM), /* PWP_UINT32 id */
 
-        PWP_FILEDEST_FOLDER,  /* CAEP_ENUM_FILEDEST fileDest */
+        PWP_FILEDEST_FOLDER,  /* PWP_ENUM_FILEDEST fileDest */
 
         PWP_FALSE,               /* PWP_BOOL allowedExportConditionsOnly */
         PWP_TRUE,               /* PWP_BOOL allowedVolumeConditions */
