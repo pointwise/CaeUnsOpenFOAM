@@ -1,6 +1,6 @@
-## Building the OpenFOAM Plugin
+## Building the OpenFOAM CAE Export Plugin
 
-To build the **OpenFOAM** plugin you must integrate the source code from 
+To build the **OpenFOAM** CAE Export plugin you must integrate the source code from 
 this repository into your local PluginSDK installation.
 
 This plugin was created with the `mkplugin` options `-c` and `-caeu`.
