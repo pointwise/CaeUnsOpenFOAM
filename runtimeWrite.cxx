@@ -1130,8 +1130,7 @@ public:
         if (VcCells & vc.tid) {
             // build cell set
             cellSetFile_ = new FoamCellSetFile;
-            cellSetFile_->open(uniqueSafeFileName(vc.name, usedNames,
-                "-cells"));
+            cellSetFile_->open(uniqueSafeFileName(vc.name, usedNames));
         }
         pwpCwdPop();
     }
